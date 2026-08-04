@@ -21,6 +21,7 @@ void main() {
     expect(find.text('Send Audio'), findsOneWidget);
     expect(find.text('Play Recording'), findsOneWidget);
     expect(find.text('Test Vibration'), findsOneWidget);
+    expect(find.text('ESP32 BLE Control'), findsOneWidget);
     expect(find.byTooltip('Settings'), findsOneWidget);
     expect(
       find.text('Tap Listen to record a short audio clip.'),

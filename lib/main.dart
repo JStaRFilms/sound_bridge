@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'ble/esp32_ble_page.dart';
 import 'vibration_service.dart';
 
 const _uploadEndpoint = String.fromEnvironment(
@@ -428,6 +429,14 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
+  Future<void> _openEsp32BleControl() async {
+    if (_isRecording || _isUploading) return;
+
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (context) => const Esp32BlePage()),
+    );
+  }
+
   bool _isValidEndpoint(Uri? uri) {
     if (uri == null) return false;
 
@@ -608,6 +617,20 @@ class _DashboardPageState extends State<DashboardPage> {
                                 : _openVibrationTester,
                             icon: const Icon(Icons.vibration_rounded),
                             label: const Text('Test Vibration'),
+                            style: OutlinedButton.styleFrom(
+                              minimumSize: const Size.fromHeight(52),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          OutlinedButton.icon(
+                            onPressed: _isRecording || _isUploading
+                                ? null
+                                : _openEsp32BleControl,
+                            icon: const Icon(Icons.bluetooth_rounded),
+                            label: const Text('ESP32 BLE Control'),
                             style: OutlinedButton.styleFrom(
                               minimumSize: const Size.fromHeight(52),
                               shape: RoundedRectangleBorder(
