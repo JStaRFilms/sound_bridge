@@ -5,8 +5,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sound_bridge/main.dart';
 
 void main() {
-  setUp(() {
+  setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.clear();
   });
 
   testWidgets('Dashboard shows recording and upload controls', (
@@ -24,6 +26,7 @@ void main() {
       find.text('Tap Listen to record a short audio clip.'),
       findsOneWidget,
     );
+    expect(find.text('Target: not set'), findsOneWidget);
   });
 
   testWidgets('Vibration tester opens with configurable controls', (
@@ -41,7 +44,7 @@ void main() {
     expect(find.text('Vibrate'), findsOneWidget);
   });
 
-  testWidgets('Settings sheet saves an API endpoint', (
+  testWidgets('Settings sheet saves endpoint and target name', (
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(const SoundBridgeApp());
@@ -49,17 +52,22 @@ void main() {
     await tester.tap(find.byTooltip('Settings'));
     await tester.pumpAndSettle();
 
+    final textFields = find.byType(TextField);
+    expect(textFields, findsNWidgets(2));
+
     await tester.enterText(
-      find.byType(EditableText),
-      'http://192.168.1.10:8000/audio',
+      textFields.at(0),
+      'http://192.168.1.10:8000/v1/audio/analyze',
     );
-    await tester.tap(find.text('Save Endpoint'));
+    await tester.enterText(textFields.at(1), 'john');
+    await tester.tap(find.text('Save Settings'));
     await tester.pumpAndSettle();
 
     expect(
-      find.text('Endpoint: http://192.168.1.10:8000/audio'),
+      find.text('Endpoint: http://192.168.1.10:8000/v1/audio/analyze'),
       findsOneWidget,
     );
+    expect(find.text('Target: john'), findsOneWidget);
   });
 
   testWidgets('Send Audio starts disabled', (WidgetTester tester) async {
@@ -72,5 +80,30 @@ void main() {
       find.text('Tap Listen to record a short audio clip.'),
       findsOneWidget,
     );
+  });
+
+  testWidgets('Settings can save endpoint without target name', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const SoundBridgeApp());
+
+    await tester.tap(find.byTooltip('Settings'));
+    await tester.pumpAndSettle();
+
+    final textFields = find.byType(TextField);
+
+    await tester.enterText(
+      textFields.at(0),
+      'http://127.0.0.1:8000/v1/audio/analyze',
+    );
+    await tester.enterText(textFields.at(1), '');
+    await tester.tap(find.text('Save Settings'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.text('Endpoint: http://127.0.0.1:8000/v1/audio/analyze'),
+      findsOneWidget,
+    );
+    expect(find.text('Target: not set'), findsOneWidget);
   });
 }

@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,9 +14,20 @@ import 'vibration_service.dart';
 
 const _uploadEndpoint = String.fromEnvironment(
   'AUDIO_UPLOAD_ENDPOINT',
-  defaultValue: 'https://example.com/audio',
+  defaultValue: 'http://127.0.0.1:8000/v1/audio/analyze',
 );
+const _legacyUploadEndpoint = 'https://example.com/audio';
+const _legacyNameMentionPath = '/v1/audio/name-mention';
+const _analyzePath = '/v1/audio/analyze';
 const _uploadEndpointKey = 'upload_endpoint';
+const _targetNameKey = 'target_name';
+
+class SettingsValues {
+  const SettingsValues({required this.endpoint, required this.targetName});
+
+  final String endpoint;
+  final String targetName;
+}
 
 void main() {
   runApp(const SoundBridgeApp());
@@ -45,7 +58,10 @@ class SoundBridgeApp extends StatelessWidget {
 enum DashboardStatus { idle, recording, ready, uploading, success, error }
 
 class DashboardPage extends StatefulWidget {
-  const DashboardPage({super.key});
+  const DashboardPage({super.key, this.initialRecordingPath});
+
+  /// Used by widget tests to simulate a completed recording.
+  final String? initialRecordingPath;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -59,6 +75,7 @@ class _DashboardPageState extends State<DashboardPage> {
   DashboardStatus _status = DashboardStatus.idle;
   String? _recordingPath;
   String _uploadEndpointUrl = _uploadEndpoint;
+  String _targetName = '';
   String _message = 'Tap Listen to record a short audio clip.';
   bool _isPlaying = false;
   StreamSubscription<void>? _playerCompleteSubscription;
@@ -67,10 +84,106 @@ class _DashboardPageState extends State<DashboardPage> {
   bool get _isUploading => _status == DashboardStatus.uploading;
   bool get _hasRecording => _recordingPath != null;
 
+  void _showSendAudioError(String message) {
+    if (!mounted) return;
+
+    debugPrint('Send Audio Error: $message');
+
+    setState(() {
+      _status = DashboardStatus.error;
+      _message = message;
+    });
+
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: const Color(0xFFB91C1C),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+  }
+
+  String _formatUploadFailure(int statusCode, String responseBody) {
+    final trimmedBody = responseBody.trim();
+    if (trimmedBody.isEmpty) {
+      return 'Upload failed with status $statusCode. Server returned no response body.';
+    }
+
+    return 'Upload failed with status $statusCode: $trimmedBody';
+  }
+
+  String _normalizeUploadEndpoint(String endpoint) {
+    final uri = Uri.tryParse(endpoint);
+    if (uri == null || uri.path != _legacyNameMentionPath) {
+      return endpoint;
+    }
+
+    return uri.replace(path: _analyzePath).toString();
+  }
+
+  String _formatUploadSuccess(String responseBody) {
+    const fallbackMessage = 'Audio sent successfully.';
+    final trimmedBody = responseBody.trim();
+
+    if (trimmedBody.isEmpty) {
+      return fallbackMessage;
+    }
+
+    try {
+      final decoded = jsonDecode(trimmedBody);
+      if (decoded is! Map<String, dynamic>) {
+        return fallbackMessage;
+      }
+
+      final nameMention = decoded['name_mention'];
+      final soundClassification = decoded['sound_classification'];
+      final namePayload = nameMention is Map<String, dynamic>
+          ? nameMention
+          : decoded;
+      final soundPayload = soundClassification is Map<String, dynamic>
+          ? soundClassification
+          : null;
+      final targetName = namePayload['target_name']?.toString().trim();
+      final text = namePayload['text']?.toString().trim();
+      final mentioned = namePayload['mentioned'] == true;
+      final category = soundPayload?['category']?.toString().trim();
+      final soundMatched = soundPayload?['matched'] == true;
+      final lines = <String>[fallbackMessage];
+
+      if (mentioned && targetName != null && targetName.isNotEmpty) {
+        lines.add('The user\'s name "$targetName" was mentioned.');
+      }
+
+      if (soundMatched && category != null && category.isNotEmpty) {
+        lines.add('Detected sound: $category.');
+      }
+
+      if (!mentioned && soundMatched != true) {
+        lines.add('No target name or known sound was detected.');
+      }
+
+      if (mentioned && text != null && text.isNotEmpty) {
+        lines.add('Text: $text');
+      }
+
+      return lines.join('\n');
+    } catch (_) {
+      return fallbackMessage;
+    }
+  }
+
   @override
   void initState() {
     super.initState();
-    _loadSavedEndpoint();
+    final initialRecordingPath = widget.initialRecordingPath;
+    if (initialRecordingPath != null) {
+      _recordingPath = initialRecordingPath;
+      _status = DashboardStatus.ready;
+      _message = 'Audio is ready to send.';
+    }
+    _loadSavedSettings();
     _playerCompleteSubscription = _player.onPlayerComplete.listen((_) {
       if (!mounted) return;
 
@@ -116,11 +229,11 @@ class _DashboardPageState extends State<DashboardPage> {
 
     final tempDirectory = await getTemporaryDirectory();
     final path =
-        '${tempDirectory.path}/sound_bridge_${DateTime.now().millisecondsSinceEpoch}.m4a';
+        '${tempDirectory.path}/sound_bridge_${DateTime.now().millisecondsSinceEpoch}.wav';
 
     await _recorder.start(
       const RecordConfig(
-        encoder: AudioEncoder.aacLc,
+        encoder: AudioEncoder.wav,
         bitRate: 128000,
         sampleRate: 44100,
       ),
@@ -136,6 +249,7 @@ class _DashboardPageState extends State<DashboardPage> {
 
   Future<void> _stopRecording() async {
     final path = await _recorder.stop();
+    debugPrint('Recorded Audio Path: ${path ?? 'none'}');
 
     setState(() {
       _recordingPath = path;
@@ -150,20 +264,29 @@ class _DashboardPageState extends State<DashboardPage> {
     final path = _recordingPath;
 
     if (path == null) {
-      setState(() {
-        _status = DashboardStatus.error;
-        _message = 'Record audio before sending.';
-      });
+      _showSendAudioError('Record audio before sending.');
+      return;
+    }
+
+    final targetName = _targetName.trim();
+
+    if (targetName.isEmpty) {
+      _showSendAudioError('Set a target name in Settings.');
       return;
     }
 
     final audioFile = File(path);
+    final filename = audioFile.uri.pathSegments.last;
+
+    if (!filename.toLowerCase().endsWith('.wav')) {
+      _showSendAudioError(
+        'Recorded audio must be a .wav file, but got "$filename". Record a new clip and try again.',
+      );
+      return;
+    }
 
     if (!await audioFile.exists()) {
-      setState(() {
-        _status = DashboardStatus.error;
-        _message = 'The recorded audio file could not be found.';
-      });
+      _showSendAudioError('The recorded audio file could not be found.');
       return;
     }
 
@@ -176,52 +299,70 @@ class _DashboardPageState extends State<DashboardPage> {
       final endpoint = Uri.tryParse(_uploadEndpointUrl);
 
       if (!_isValidEndpoint(endpoint)) {
-        setState(() {
-          _status = DashboardStatus.error;
-          _message = 'Set a valid upload endpoint in Settings.';
-        });
+        _showSendAudioError('Set a valid upload endpoint in Settings.');
         return;
       }
 
       final request = http.MultipartRequest('POST', endpoint!)
-        ..files.add(await http.MultipartFile.fromPath('audio', path));
+        ..headers['accept'] = 'application/json'
+        ..fields['target_name'] = targetName
+        ..files.add(
+          await http.MultipartFile.fromPath(
+            'file',
+            path,
+            contentType: MediaType('audio', 'wav'),
+          ),
+        );
+
+      debugPrint('Send Audio Filename: $filename');
 
       final response = await request.send();
+      final responseBody = await response.stream.bytesToString();
+      debugPrint(
+        'Analyze Response (${response.statusCode}): $responseBody',
+        wrapWidth: 1024,
+      );
 
       if (response.statusCode >= 200 && response.statusCode < 300) {
         setState(() {
           _status = DashboardStatus.success;
-          _message = 'Audio sent successfully.';
+          _message = _formatUploadSuccess(responseBody);
         });
       } else {
-        setState(() {
-          _status = DashboardStatus.error;
-          _message = 'Upload failed with status ${response.statusCode}.';
-        });
+        _showSendAudioError(
+          _formatUploadFailure(response.statusCode, responseBody),
+        );
       }
-    } catch (_) {
-      setState(() {
-        _status = DashboardStatus.error;
-        _message = 'Upload failed. Check the endpoint and connection.';
-      });
+    } catch (error) {
+      final errorText = error.toString().trim();
+      final detail = errorText.isEmpty ? '' : ' - $errorText';
+      _showSendAudioError('Upload failed: ${error.runtimeType}$detail');
     }
   }
 
-  Future<void> _loadSavedEndpoint() async {
+  Future<void> _loadSavedSettings() async {
     final preferences = await SharedPreferences.getInstance();
     final savedEndpoint = preferences.getString(_uploadEndpointKey);
+    final savedTargetName = preferences.getString(_targetNameKey);
 
-    if (!mounted || savedEndpoint == null || savedEndpoint.trim().isEmpty) {
-      return;
-    }
+    if (!mounted) return;
 
     setState(() {
-      _uploadEndpointUrl = savedEndpoint.trim();
+      if (savedEndpoint != null && savedEndpoint.trim().isNotEmpty) {
+        final trimmedEndpoint = _normalizeUploadEndpoint(savedEndpoint.trim());
+        if (trimmedEndpoint != _legacyUploadEndpoint) {
+          _uploadEndpointUrl = trimmedEndpoint;
+        }
+      }
+      if (savedTargetName != null) {
+        _targetName = savedTargetName.trim();
+      }
     });
   }
 
-  Future<void> _saveEndpoint(String endpoint) async {
-    final trimmedEndpoint = endpoint.trim();
+  Future<void> _saveSettings(SettingsValues settings) async {
+    final trimmedEndpoint = _normalizeUploadEndpoint(settings.endpoint.trim());
+    final trimmedTargetName = settings.targetName.trim();
     final uri = Uri.tryParse(trimmedEndpoint);
 
     if (trimmedEndpoint.isEmpty || !_isValidEndpoint(uri)) {
@@ -234,12 +375,14 @@ class _DashboardPageState extends State<DashboardPage> {
 
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(_uploadEndpointKey, trimmedEndpoint);
+    await preferences.setString(_targetNameKey, trimmedTargetName);
 
     if (!mounted) return;
 
     setState(() {
       _uploadEndpointUrl = trimmedEndpoint;
-      _message = 'Upload endpoint updated.';
+      _targetName = trimmedTargetName;
+      _message = 'Settings updated.';
       if (_status == DashboardStatus.error) {
         _status = _hasRecording ? DashboardStatus.ready : DashboardStatus.idle;
       }
@@ -247,7 +390,7 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Future<void> _openSettings() async {
-    final endpoint = await showModalBottomSheet<String>(
+    final settings = await showModalBottomSheet<SettingsValues>(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
@@ -256,12 +399,15 @@ class _DashboardPageState extends State<DashboardPage> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
       ),
       builder: (context) {
-        return EndpointSettingsSheet(initialEndpoint: _uploadEndpointUrl);
+        return SettingsSheet(
+          initialEndpoint: _uploadEndpointUrl,
+          initialTargetName: _targetName,
+        );
       },
     );
 
-    if (endpoint != null) {
-      await _saveEndpoint(endpoint);
+    if (settings != null) {
+      await _saveSettings(settings);
     }
   }
 
@@ -476,6 +622,15 @@ class _DashboardPageState extends State<DashboardPage> {
                             style: Theme.of(context).textTheme.labelSmall
                                 ?.copyWith(color: const Color(0xFF94A3B8)),
                           ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _targetName.isEmpty
+                                ? 'Target: not set'
+                                : 'Target: $_targetName',
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.labelSmall
+                                ?.copyWith(color: const Color(0xFF94A3B8)),
+                          ),
                         ],
                       ),
                     ),
@@ -490,28 +645,47 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 }
 
-class EndpointSettingsSheet extends StatefulWidget {
-  const EndpointSettingsSheet({required this.initialEndpoint, super.key});
+class SettingsSheet extends StatefulWidget {
+  const SettingsSheet({
+    required this.initialEndpoint,
+    required this.initialTargetName,
+    super.key,
+  });
 
   final String initialEndpoint;
+  final String initialTargetName;
 
   @override
-  State<EndpointSettingsSheet> createState() => _EndpointSettingsSheetState();
+  State<SettingsSheet> createState() => _SettingsSheetState();
 }
 
-class _EndpointSettingsSheetState extends State<EndpointSettingsSheet> {
+class _SettingsSheetState extends State<SettingsSheet> {
   late final TextEditingController _endpointController;
+  late final TextEditingController _targetNameController;
 
   @override
   void initState() {
     super.initState();
     _endpointController = TextEditingController(text: widget.initialEndpoint);
+    _targetNameController = TextEditingController(
+      text: widget.initialTargetName,
+    );
   }
 
   @override
   void dispose() {
     _endpointController.dispose();
+    _targetNameController.dispose();
     super.dispose();
+  }
+
+  void _save() {
+    Navigator.of(context).pop(
+      SettingsValues(
+        endpoint: _endpointController.text,
+        targetName: _targetNameController.text,
+      ),
+    );
   }
 
   @override
@@ -548,25 +722,34 @@ class _EndpointSettingsSheetState extends State<EndpointSettingsSheet> {
               controller: _endpointController,
               autofocus: true,
               keyboardType: TextInputType.url,
-              textInputAction: TextInputAction.done,
+              textInputAction: TextInputAction.next,
               decoration: InputDecoration(
                 labelText: 'API endpoint',
-                hintText: 'http://192.168.1.10:8000/audio',
+                hintText: 'http://127.0.0.1:8000/v1/audio/analyze',
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(8),
                 ),
               ),
-              onSubmitted: (_) {
-                Navigator.of(context).pop(_endpointController.text);
-              },
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _targetNameController,
+              keyboardType: TextInputType.name,
+              textInputAction: TextInputAction.done,
+              decoration: InputDecoration(
+                labelText: 'Target name',
+                hintText: 'john',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              onSubmitted: (_) => _save(),
             ),
             const SizedBox(height: 16),
             FilledButton.icon(
-              onPressed: () {
-                Navigator.of(context).pop(_endpointController.text);
-              },
+              onPressed: _save,
               icon: const Icon(Icons.check_rounded),
-              label: const Text('Save Endpoint'),
+              label: const Text('Save Settings'),
               style: FilledButton.styleFrom(
                 minimumSize: const Size.fromHeight(52),
                 shape: RoundedRectangleBorder(
@@ -850,6 +1033,7 @@ class StatusText extends StatelessWidget {
         message,
         key: ValueKey(message),
         textAlign: TextAlign.center,
+        softWrap: true,
         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
           color: color,
           fontWeight: FontWeight.w600,
