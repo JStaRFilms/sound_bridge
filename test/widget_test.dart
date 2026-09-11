@@ -20,8 +20,8 @@ void main() {
     expect(find.text('Listen'), findsOneWidget);
     expect(find.text('Send Audio'), findsOneWidget);
     expect(find.text('Play Recording'), findsOneWidget);
-    expect(find.text('Test Vibration'), findsOneWidget);
-    expect(find.text('ESP32 BLE Control'), findsOneWidget);
+    expect(find.text('ESP32 Output'), findsNothing);
+    expect(find.text('ESP32 BLE Control'), findsNothing);
     expect(find.byTooltip('Settings'), findsOneWidget);
     expect(
       find.text('Tap Listen to record a short audio clip.'),
@@ -30,19 +30,48 @@ void main() {
     expect(find.text('Target: not set'), findsOneWidget);
   });
 
-  testWidgets('Vibration tester opens with configurable controls', (
+  testWidgets('triple tapping the header opens hidden ESP32 debug controls', (
     WidgetTester tester,
   ) async {
     await tester.pumpWidget(const SoundBridgeApp());
 
-    await tester.ensureVisible(find.text('Test Vibration'));
-    await tester.tap(find.text('Test Vibration'));
+    final header = find.byKey(const Key('soundBridgeHeader'));
+    await tester.tap(header);
+    await tester.tap(header);
+    await tester.tap(header);
     await tester.pumpAndSettle();
 
-    expect(find.text('Vibration'), findsOneWidget);
-    expect(find.text('Length'), findsOneWidget);
-    expect(find.text('Intensity'), findsOneWidget);
-    expect(find.text('Vibrate'), findsOneWidget);
+    expect(find.text('ESP32 Debug'), findsOneWidget);
+    expect(find.text('ESP32 Output'), findsOneWidget);
+    expect(find.text('ESP32 BLE Control'), findsOneWidget);
+
+    final sliders = tester.widgetList<Slider>(find.byType(Slider)).toList();
+    final intensitySlider = sliders.singleWhere((slider) => slider.min == 0);
+    final durationSlider = sliders.singleWhere((slider) => slider.min == 1);
+
+    expect(intensitySlider.max, 255);
+    expect(intensitySlider.divisions, 255);
+    expect(intensitySlider.onChanged, isNull);
+    expect(durationSlider.value, 5);
+    expect(durationSlider.max, 30);
+    expect(durationSlider.onChanged, isNull);
+    expect(
+      find.text('Connect the ESP32 from Settings to enable these controls.'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('Settings provides ESP32 connection controls', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const SoundBridgeApp());
+
+    await tester.tap(find.byTooltip('Settings'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('ESP32 Bluetooth'), findsOneWidget);
+    expect(find.text('Not connected'), findsOneWidget);
+    expect(find.text('Scan for ESP32'), findsOneWidget);
   });
 
   testWidgets('Settings sheet saves endpoint and target name', (

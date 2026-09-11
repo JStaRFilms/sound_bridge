@@ -10,7 +10,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'ble/esp32_ble_controller.dart';
 import 'ble/esp32_ble_page.dart';
+import 'ble/server_response_ble_event_handler.dart';
 import 'vibration_service.dart';
 
 const _uploadEndpoint = String.fromEnvironment(
@@ -69,9 +71,12 @@ class DashboardPage extends StatefulWidget {
 }
 
 class _DashboardPageState extends State<DashboardPage> {
+  static const _headerTapWindow = Duration(milliseconds: 700);
+
   final AudioRecorder _recorder = AudioRecorder();
   final AudioPlayer _player = AudioPlayer();
-  final VibrationService _vibrationService = const VibrationService();
+  final Esp32BleController _bleController = Esp32BleController();
+  late final ServerResponseBleEventHandler _bleResponseEventHandler;
 
   DashboardStatus _status = DashboardStatus.idle;
   String? _recordingPath;
@@ -80,6 +85,8 @@ class _DashboardPageState extends State<DashboardPage> {
   String _message = 'Tap Listen to record a short audio clip.';
   bool _isPlaying = false;
   StreamSubscription<void>? _playerCompleteSubscription;
+  Timer? _headerTapResetTimer;
+  int _headerTapCount = 0;
 
   bool get _isRecording => _status == DashboardStatus.recording;
   bool get _isUploading => _status == DashboardStatus.uploading;
@@ -178,6 +185,9 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void initState() {
     super.initState();
+    _bleResponseEventHandler = ServerResponseBleEventHandler(
+      output: _bleController,
+    );
     final initialRecordingPath = widget.initialRecordingPath;
     if (initialRecordingPath != null) {
       _recordingPath = initialRecordingPath;
@@ -198,8 +208,12 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void dispose() {
     _playerCompleteSubscription?.cancel();
+    _headerTapResetTimer?.cancel();
     _player.dispose();
     _recorder.dispose();
+    _bleResponseEventHandler.dispose();
+    unawaited(_bleController.close());
+    _bleController.dispose();
     super.dispose();
   }
 
@@ -329,6 +343,9 @@ class _DashboardPageState extends State<DashboardPage> {
           _status = DashboardStatus.success;
           _message = _formatUploadSuccess(responseBody);
         });
+        unawaited(
+          _bleResponseEventHandler.handleSuccessfulResponse(responseBody),
+        );
       } else {
         _showSendAudioError(
           _formatUploadFailure(response.statusCode, responseBody),
@@ -403,6 +420,7 @@ class _DashboardPageState extends State<DashboardPage> {
         return SettingsSheet(
           initialEndpoint: _uploadEndpointUrl,
           initialTargetName: _targetName,
+          bleController: _bleController,
         );
       },
     );
@@ -412,29 +430,27 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
-  Future<void> _openVibrationTester() async {
-    if (_isRecording || _isUploading) return;
-
-    await showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+  Future<void> _openEsp32DebugPage() async {
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (context) => Esp32DebugPage(controller: _bleController),
       ),
-      builder: (context) {
-        return VibrationTestSheet(vibrationService: _vibrationService);
-      },
     );
   }
 
-  Future<void> _openEsp32BleControl() async {
-    if (_isRecording || _isUploading) return;
+  void _handleHeaderTap() {
+    _headerTapResetTimer?.cancel();
+    _headerTapCount += 1;
 
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(builder: (context) => const Esp32BlePage()),
-    );
+    if (_headerTapCount == 3) {
+      _headerTapCount = 0;
+      unawaited(_openEsp32DebugPage());
+      return;
+    }
+
+    _headerTapResetTimer = Timer(_headerTapWindow, () {
+      _headerTapCount = 0;
+    });
   }
 
   bool _isValidEndpoint(Uri? uri) {
@@ -527,13 +543,18 @@ class _DashboardPageState extends State<DashboardPage> {
                             children: [
                               const SizedBox.square(dimension: 48),
                               Expanded(
-                                child: Text(
-                                  'Sound Bridge',
-                                  textAlign: TextAlign.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .headlineMedium
-                                      ?.copyWith(fontWeight: FontWeight.w700),
+                                child: GestureDetector(
+                                  key: const Key('soundBridgeHeader'),
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: _handleHeaderTap,
+                                  child: Text(
+                                    'Sound Bridge',
+                                    textAlign: TextAlign.center,
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .headlineMedium
+                                        ?.copyWith(fontWeight: FontWeight.w700),
+                                  ),
                                 ),
                               ),
                               SizedBox.square(
@@ -610,34 +631,6 @@ class _DashboardPageState extends State<DashboardPage> {
                               ),
                             ),
                           ),
-                          const SizedBox(height: 12),
-                          OutlinedButton.icon(
-                            onPressed: _isRecording || _isUploading
-                                ? null
-                                : _openVibrationTester,
-                            icon: const Icon(Icons.vibration_rounded),
-                            label: const Text('Test Vibration'),
-                            style: OutlinedButton.styleFrom(
-                              minimumSize: const Size.fromHeight(52),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          OutlinedButton.icon(
-                            onPressed: _isRecording || _isUploading
-                                ? null
-                                : _openEsp32BleControl,
-                            icon: const Icon(Icons.bluetooth_rounded),
-                            label: const Text('ESP32 BLE Control'),
-                            style: OutlinedButton.styleFrom(
-                              minimumSize: const Size.fromHeight(52),
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                            ),
-                          ),
                           const SizedBox(height: 32),
                           Text(
                             'Endpoint: $_uploadEndpointUrl',
@@ -668,15 +661,72 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 }
 
+class Esp32DebugPage extends StatelessWidget {
+  const Esp32DebugPage({required this.controller, super.key});
+
+  final Esp32BleController controller;
+
+  Future<void> _openBleControl(BuildContext context) async {
+    await controller.initialize();
+    if (!context.mounted) return;
+
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (context) => Esp32BlePage(controller: controller),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('ESP32 Debug')),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  DashboardIntensitySlider(
+                    controller: controller,
+                    isDisabled: false,
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    onPressed: () => _openBleControl(context),
+                    icon: const Icon(Icons.bluetooth_rounded),
+                    label: const Text('ESP32 BLE Control'),
+                    style: OutlinedButton.styleFrom(
+                      minimumSize: const Size.fromHeight(52),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class SettingsSheet extends StatefulWidget {
   const SettingsSheet({
     required this.initialEndpoint,
     required this.initialTargetName,
+    required this.bleController,
     super.key,
   });
 
   final String initialEndpoint;
   final String initialTargetName;
+  final Esp32BleController bleController;
 
   @override
   State<SettingsSheet> createState() => _SettingsSheetState();
@@ -715,74 +765,396 @@ class _SettingsSheetState extends State<SettingsSheet> {
   Widget build(BuildContext context) {
     final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
 
-    return Padding(
+    return SingleChildScrollView(
       padding: EdgeInsets.fromLTRB(24, 20, 24, bottomInset + 24),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 420),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    'Settings',
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Settings',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
+                  IconButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    tooltip: 'Close',
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              TextField(
+                controller: _endpointController,
+                autofocus: true,
+                keyboardType: TextInputType.url,
+                textInputAction: TextInputAction.next,
+                decoration: InputDecoration(
+                  labelText: 'API endpoint',
+                  hintText: 'http://127.0.0.1:8000/v1/audio/analyze',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
-                IconButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  tooltip: 'Close',
-                  icon: const Icon(Icons.close_rounded),
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: _targetNameController,
+                keyboardType: TextInputType.name,
+                textInputAction: TextInputAction.done,
+                decoration: InputDecoration(
+                  labelText: 'Target name',
+                  hintText: 'john',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                onSubmitted: (_) => _save(),
+              ),
+              const SizedBox(height: 16),
+              BleSettingsCard(controller: widget.bleController),
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: _save,
+                icon: const Icon(Icons.check_rounded),
+                label: const Text('Save Settings'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class BleSettingsCard extends StatelessWidget {
+  const BleSettingsCard({required this.controller, super.key});
+
+  final Esp32BleController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        final isConnected = controller.isConnected;
+        final statusColor = isConnected
+            ? const Color(0xFF15803D)
+            : const Color(0xFF64748B);
+
+        return Card(
+          margin: EdgeInsets.zero,
+          elevation: 0,
+          color: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: Color(0xFFE2E8F0)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.bluetooth_rounded, color: statusColor),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'ESP32 Bluetooth',
+                            style: Theme.of(context).textTheme.titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w700),
+                          ),
+                          Text(
+                            _bleSettingsStatus(controller),
+                            style: Theme.of(
+                              context,
+                            ).textTheme.bodySmall?.copyWith(color: statusColor),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                if (controller.errorMessage != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    controller.errorMessage!,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF64748B),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 14),
+                _BleSettingsAction(controller: controller),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _BleSettingsAction extends StatelessWidget {
+  const _BleSettingsAction({required this.controller});
+
+  final Esp32BleController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final buttonStyle = FilledButton.styleFrom(
+      minimumSize: const Size.fromHeight(46),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    );
+
+    if (controller.isConnected) {
+      return OutlinedButton.icon(
+        onPressed: controller.commandInProgress ? null : controller.disconnect,
+        icon: const Icon(Icons.bluetooth_disabled_rounded),
+        label: const Text('Disconnect ESP32'),
+      );
+    }
+
+    if (controller.isScanning) {
+      return OutlinedButton.icon(
+        onPressed: controller.stopScan,
+        icon: const Icon(Icons.stop_rounded),
+        label: const Text('Cancel Scan'),
+      );
+    }
+
+    if (controller.status == Esp32BleStatus.connecting) {
+      return FilledButton.icon(
+        onPressed: null,
+        icon: const SizedBox.square(
+          dimension: 18,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        label: const Text('Connecting'),
+        style: buttonStyle,
+      );
+    }
+
+    if (controller.status == Esp32BleStatus.deviceFound) {
+      return FilledButton.icon(
+        onPressed: controller.connect,
+        icon: const Icon(Icons.bluetooth_connected_rounded),
+        label: const Text('Connect to ESP32-D4-BLE'),
+        style: buttonStyle,
+      );
+    }
+
+    if (controller.status == Esp32BleStatus.bluetoothDisabled) {
+      return FilledButton.icon(
+        onPressed: controller.requestBluetoothOn,
+        icon: const Icon(Icons.bluetooth_rounded),
+        label: const Text('Turn On Bluetooth'),
+        style: buttonStyle,
+      );
+    }
+
+    if (controller.status == Esp32BleStatus.permissionDenied &&
+        controller.permissionPermanentlyDenied) {
+      return FilledButton.icon(
+        onPressed: controller.openSettings,
+        icon: const Icon(Icons.settings_rounded),
+        label: const Text('Open App Settings'),
+        style: buttonStyle,
+      );
+    }
+
+    if (controller.status == Esp32BleStatus.disconnected &&
+        controller.deviceId != null) {
+      return FilledButton.icon(
+        onPressed: controller.reconnect,
+        icon: const Icon(Icons.refresh_rounded),
+        label: const Text('Reconnect ESP32'),
+        style: buttonStyle,
+      );
+    }
+
+    if (controller.status == Esp32BleStatus.bluetoothUnsupported) {
+      return const SizedBox.shrink();
+    }
+
+    return FilledButton.icon(
+      onPressed: controller.initializeAndScan,
+      icon: const Icon(Icons.bluetooth_searching_rounded),
+      label: Text(
+        controller.status == Esp32BleStatus.error
+            ? 'Retry ESP32 Scan'
+            : 'Scan for ESP32',
+      ),
+      style: buttonStyle,
+    );
+  }
+}
+
+String _bleSettingsStatus(Esp32BleController controller) {
+  return switch (controller.status) {
+    Esp32BleStatus.initializing => 'Not connected',
+    Esp32BleStatus.ready => 'Ready to scan',
+    Esp32BleStatus.scanning => 'Scanning for ESP32-D4-BLE…',
+    Esp32BleStatus.deviceFound => 'ESP32-D4-BLE found',
+    Esp32BleStatus.connecting => 'Connecting…',
+    Esp32BleStatus.connected => 'Connected to ESP32-D4-BLE',
+    Esp32BleStatus.disconnected => 'Disconnected',
+    Esp32BleStatus.bluetoothUnsupported => 'BLE is unavailable',
+    Esp32BleStatus.bluetoothDisabled => 'Bluetooth is off',
+    Esp32BleStatus.permissionDenied => 'Bluetooth permission required',
+    Esp32BleStatus.error => 'Connection error',
+  };
+}
+
+class DashboardIntensitySlider extends StatelessWidget {
+  const DashboardIntensitySlider({
+    required this.controller,
+    required this.isDisabled,
+    super.key,
+  });
+
+  final Esp32BleController controller;
+  final bool isDisabled;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: controller,
+      builder: (context, _) {
+        final enabled = controller.canControlHardware && !isDisabled;
+        final value = controller.intensity;
+        final percentage = controller.intensityPercentage;
+
+        return Card(
+          margin: EdgeInsets.zero,
+          elevation: 0,
+          color: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: Color(0xFFE2E8F0)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.tune_rounded, color: Color(0xFF2563EB)),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'ESP32 Output',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '$value / 255  •  $percentage%',
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                        color: const Color(0xFF2563EB),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+                Slider(
+                  min: 0,
+                  max: Esp32BleController.maxIntensity.toDouble(),
+                  divisions: Esp32BleController.maxIntensity,
+                  value: value.toDouble(),
+                  label: '$value',
+                  onChanged: enabled
+                      ? (next) => controller.updateIntensity(next.round())
+                      : null,
+                ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Duration',
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    Text('${controller.durationSeconds}s'),
+                  ],
+                ),
+                Slider(
+                  min: 1,
+                  max: Esp32BleController.maxDurationSeconds.toDouble(),
+                  divisions: Esp32BleController.maxDurationSeconds - 1,
+                  value: controller.durationSeconds.toDouble(),
+                  label: '${controller.durationSeconds}s',
+                  onChanged: enabled
+                      ? (next) => controller.updateDuration(next.round())
+                      : null,
+                ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: enabled ? controller.startOutput : null,
+                        icon: controller.commandInProgress
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.play_arrow_rounded),
+                        label: const Text('Start'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: enabled ? controller.stopOutput : null,
+                        icon: const Icon(Icons.stop_rounded),
+                        label: const Text('Stop'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  controller.isConnected
+                      ? controller.commandInProgress
+                            ? 'Sending command…'
+                            : controller.hasConfirmedState
+                            ? '${controller.isHardwareRunning ? 'Running' : 'Stopped'} • confirmed ${controller.confirmedIntensity} / 255 for ${controller.confirmedDurationSeconds}s'
+                            : 'Connected • waiting for hardware state'
+                      : 'Connect the ESP32 from Settings to enable these controls.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF64748B),
+                  ),
                 ),
               ],
             ),
-            const SizedBox(height: 20),
-            TextField(
-              controller: _endpointController,
-              autofocus: true,
-              keyboardType: TextInputType.url,
-              textInputAction: TextInputAction.next,
-              decoration: InputDecoration(
-                labelText: 'API endpoint',
-                hintText: 'http://127.0.0.1:8000/v1/audio/analyze',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _targetNameController,
-              keyboardType: TextInputType.name,
-              textInputAction: TextInputAction.done,
-              decoration: InputDecoration(
-                labelText: 'Target name',
-                hintText: 'john',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              onSubmitted: (_) => _save(),
-            ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _save,
-              icon: const Icon(Icons.check_rounded),
-              label: const Text('Save Settings'),
-              style: FilledButton.styleFrom(
-                minimumSize: const Size.fromHeight(52),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }

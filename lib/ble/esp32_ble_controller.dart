@@ -6,6 +6,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'ble_output_commands.dart';
+
+export 'ble_output_commands.dart' show PwmHardwareState;
+
 enum Esp32BleStatus {
   initializing,
   ready,
@@ -20,9 +24,10 @@ enum Esp32BleStatus {
   error,
 }
 
-class Esp32BleController extends ChangeNotifier {
+class Esp32BleController extends ChangeNotifier implements BleOutputCommands {
   static const maxIntensity = 255;
-  static const _writeInterval = Duration(milliseconds: 75);
+  static const maxDurationSeconds = 30;
+  static const defaultDurationSeconds = 5;
   static const deviceName = 'ESP32-D4-BLE';
   static final serviceUuid = Guid('19b10000-e8f2-537e-4f6c-d104768a1214');
   static final stateCharacteristicUuid = Guid(
@@ -33,14 +38,26 @@ class Esp32BleController extends ChangeNotifier {
   );
 
   @visibleForTesting
-  static Uint8List controlPayloadFor(int intensity) {
+  static Uint8List controlPayloadFor(int intensity, [int durationSeconds = 0]) {
     RangeError.checkValueInInterval(intensity, 0, maxIntensity, 'intensity');
-    return Uint8List.fromList([intensity]);
+    RangeError.checkValueInInterval(
+      durationSeconds,
+      0,
+      maxDurationSeconds,
+      'durationSeconds',
+    );
+    final effectiveDuration = intensity == 0 && durationSeconds == 0
+        ? 0
+        : durationSeconds == 0
+        ? defaultDurationSeconds
+        : durationSeconds;
+    return Uint8List.fromList([intensity, effectiveDuration]);
   }
 
   @visibleForTesting
-  static int? intensityFromState(List<int> data) {
-    return data.isEmpty ? null : data.first;
+  static PwmHardwareState? stateFromNotification(List<int> data) {
+    if (data.length < 2) return null;
+    return PwmHardwareState(intensity: data[0], durationSeconds: data[1]);
   }
 
   @visibleForTesting
@@ -50,11 +67,15 @@ class Esp32BleController extends ChangeNotifier {
 
   Esp32BleStatus status = Esp32BleStatus.initializing;
   int intensity = 0;
-  bool hasIntensity = false;
+  int durationSeconds = defaultDurationSeconds;
+  int confirmedIntensity = 0;
+  int confirmedDurationSeconds = 0;
+  bool hasConfirmedState = false;
   BluetoothAdapterState adapterState = BluetoothAdapterState.unknown;
   ScanResult? discoveredResult;
   String? errorMessage;
   bool permissionPermanentlyDenied = false;
+  @override
   bool commandInProgress = false;
 
   BluetoothDevice? _device;
@@ -64,19 +85,24 @@ class Esp32BleController extends ChangeNotifier {
   StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   StreamSubscription<List<int>>? _stateValueSubscription;
+  final StreamController<PwmHardwareState> _hardwareStateController =
+      StreamController<PwmHardwareState>.broadcast();
   bool _connectInProgress = false;
   bool _userRequestedDisconnect = false;
-  bool _isAdjustingIntensity = false;
-  int? _pendingIntensity;
-  Timer? _writeDebounce;
-  DateTime? _lastWriteStartedAt;
-  Completer<void>? _writeLoopCompleter;
+  Completer<void>? _controlWriteCompleter;
   bool _closed = false;
 
+  @override
   bool get isConnected => status == Esp32BleStatus.connected;
+  @override
+  Stream<PwmHardwareState> get hardwareStates =>
+      _hardwareStateController.stream;
   bool get isScanning => status == Esp32BleStatus.scanning;
-  bool get canAdjustIntensity => isConnected && !_userRequestedDisconnect;
+  bool get canControlHardware =>
+      isConnected && !_userRequestedDisconnect && !commandInProgress;
+  bool get isHardwareRunning => confirmedIntensity > 0;
   int get intensityPercentage => percentageFor(intensity);
+  int get confirmedIntensityPercentage => percentageFor(confirmedIntensity);
   String? get deviceId {
     final device = _device ?? discoveredResult?.device;
     return device?.remoteId.str;
@@ -100,6 +126,33 @@ class Esp32BleController extends ChangeNotifier {
     } catch (error) {
       _setError('Unable to check Bluetooth: ${_describeError(error)}');
     }
+  }
+
+  Future<void> initializeAndScan() async {
+    await initialize();
+    if (_closed) return;
+
+    if (adapterState == BluetoothAdapterState.unknown ||
+        adapterState == BluetoothAdapterState.turningOn) {
+      try {
+        final resolvedState = await FlutterBluePlus.adapterState
+            .where(
+              (state) =>
+                  state != BluetoothAdapterState.unknown &&
+                  state != BluetoothAdapterState.turningOn,
+            )
+            .first
+            .timeout(const Duration(seconds: 5));
+        _handleAdapterState(resolvedState);
+      } on TimeoutException {
+        _setError(
+          'Bluetooth status could not be determined. Please try again.',
+        );
+        return;
+      }
+    }
+
+    if (adapterState == BluetoothAdapterState.on) await scan();
   }
 
   Future<void> scan() async {
@@ -188,8 +241,9 @@ class Esp32BleController extends ChangeNotifier {
     _device = device;
     _connectInProgress = true;
     _userRequestedDisconnect = false;
-    intensity = 0;
-    hasIntensity = false;
+    confirmedIntensity = 0;
+    confirmedDurationSeconds = 0;
+    hasConfirmedState = false;
     errorMessage = null;
     _setStatus(Esp32BleStatus.connecting);
 
@@ -262,8 +316,9 @@ class Esp32BleController extends ChangeNotifier {
       } catch (_) {
         // Preserve the original, more useful connection error.
       }
-      intensity = 0;
-      hasIntensity = false;
+      confirmedIntensity = 0;
+      confirmedDurationSeconds = 0;
+      hasConfirmedState = false;
       _setStatus(
         Esp32BleStatus.error,
         message: 'Connection failed: ${_describeError(error)}',
@@ -273,75 +328,58 @@ class Esp32BleController extends ChangeNotifier {
 
   Future<void> reconnect() => connect(_device ?? discoveredResult?.device);
 
-  void beginIntensityAdjustment() {
-    if (canAdjustIntensity) _isAdjustingIntensity = true;
+  void updateIntensity(int value) {
+    if (!isConnected || _userRequestedDisconnect) return;
+    intensity = value.clamp(0, maxIntensity).toInt();
+    _notify();
   }
 
-  void updateIntensity(int value) {
-    if (!canAdjustIntensity) return;
-
-    final nextIntensity = value.clamp(0, maxIntensity).toInt();
-    intensity = nextIntensity;
-    hasIntensity = true;
-    _pendingIntensity = nextIntensity;
-    errorMessage = null;
+  void updateDuration(int value) {
+    if (!isConnected || _userRequestedDisconnect) return;
+    durationSeconds = value.clamp(1, maxDurationSeconds).toInt();
     _notify();
+  }
 
-    _writeDebounce?.cancel();
-    _writeDebounce = Timer(
-      _writeInterval,
-      () => unawaited(_flushPendingIntensity()),
+  Future<void> startOutput() async {
+    final safeDuration = durationSeconds == 0
+        ? defaultDurationSeconds
+        : durationSeconds;
+    await sendOutputCommand(
+      intensity: intensity,
+      durationSeconds: safeDuration,
     );
   }
 
-  void finishIntensityAdjustment(int value) {
-    if (!canAdjustIntensity) return;
-
-    _isAdjustingIntensity = false;
-    updateIntensity(value);
-    _writeDebounce?.cancel();
-    unawaited(_flushPendingIntensity());
+  Future<void> stopOutput() async {
+    await sendOutputCommand(intensity: 0, durationSeconds: 0);
   }
 
-  Future<void> _flushPendingIntensity() async {
-    if (_writeLoopCompleter != null ||
-        _closed ||
-        !isConnected ||
-        _controlCharacteristic == null ||
-        _pendingIntensity == null) {
-      return;
-    }
+  @override
+  Future<bool> sendOutputCommand({
+    required int intensity,
+    required int durationSeconds,
+  }) async {
+    final characteristic = _controlCharacteristic;
+    if (!canControlHardware || characteristic == null) return false;
 
     final completer = Completer<void>();
-    _writeLoopCompleter = completer;
+    _controlWriteCompleter = completer;
     commandInProgress = true;
+    errorMessage = null;
     _notify();
 
     try {
-      while (!_closed && isConnected && _pendingIntensity != null) {
-        final lastWrite = _lastWriteStartedAt;
-        if (lastWrite != null) {
-          final elapsed = DateTime.now().difference(lastWrite);
-          final remaining = _writeInterval - elapsed;
-          if (remaining > Duration.zero) await Future<void>.delayed(remaining);
-        }
-
-        if (_closed || !isConnected || _pendingIntensity == null) break;
-
-        final nextIntensity = _pendingIntensity!;
-        _pendingIntensity = null;
-        _lastWriteStartedAt = DateTime.now();
-        await _controlCharacteristic!.write(
-          controlPayloadFor(nextIntensity),
-          withoutResponse: false,
-        );
-      }
+      await characteristic.write(
+        controlPayloadFor(intensity, durationSeconds),
+        withoutResponse: false,
+      );
+      return true;
     } catch (error) {
-      _pendingIntensity = null;
-      errorMessage = 'PWM intensity update failed: ${_describeError(error)}';
+      errorMessage = 'PWM command failed: ${_describeError(error)}';
+      return false;
     } finally {
       commandInProgress = false;
-      _writeLoopCompleter = null;
+      _controlWriteCompleter = null;
       if (!completer.isCompleted) completer.complete();
       _notify();
     }
@@ -352,7 +390,7 @@ class Esp32BleController extends ChangeNotifier {
     _connectInProgress = false;
     _notify();
     await stopScan(updateStatus: false);
-    await _cancelPendingIntensityWrites();
+    await _waitForControlWrite();
 
     final device = _device;
     await _cancelDeviceSubscriptions(keepConnectionSubscription: false);
@@ -364,8 +402,9 @@ class Esp32BleController extends ChangeNotifier {
       }
     }
 
-    intensity = 0;
-    hasIntensity = false;
+    confirmedIntensity = 0;
+    confirmedDurationSeconds = 0;
+    hasConfirmedState = false;
     _setStatus(
       Esp32BleStatus.disconnected,
       message: errorMessage ?? 'Disconnected from $deviceName.',
@@ -398,10 +437,11 @@ class Esp32BleController extends ChangeNotifier {
     _closed = true;
     _userRequestedDisconnect = true;
     await stopScan(updateStatus: false);
-    await _cancelPendingIntensityWrites();
+    await _waitForControlWrite();
     await _adapterSubscription?.cancel();
     _adapterSubscription = null;
     await _cancelDeviceSubscriptions(keepConnectionSubscription: false);
+    await _hardwareStateController.close();
     try {
       await _device?.disconnect();
     } catch (_) {
@@ -483,10 +523,11 @@ class Esp32BleController extends ChangeNotifier {
 
   Future<void> _cleanUpAfterBluetoothTurnsOff() async {
     await stopScan(updateStatus: false);
-    await _cancelPendingIntensityWrites();
+    await _waitForControlWrite();
     await _cancelDeviceSubscriptions(keepConnectionSubscription: false);
-    intensity = 0;
-    hasIntensity = false;
+    confirmedIntensity = 0;
+    confirmedDurationSeconds = 0;
+    hasConfirmedState = false;
     _notify();
   }
 
@@ -512,20 +553,30 @@ class Esp32BleController extends ChangeNotifier {
 
   void _handleStateValue(List<int> value) {
     if (_closed) return;
-    final notifiedIntensity = intensityFromState(value);
-    if (notifiedIntensity == null) return;
-    hasIntensity = true;
-    if (!_isAdjustingIntensity) {
-      intensity = notifiedIntensity;
-      _notify();
+    final hardwareState = stateFromNotification(value);
+    if (hardwareState == null) return;
+
+    final isInitialState = !hasConfirmedState;
+    confirmedIntensity = hardwareState.intensity;
+    confirmedDurationSeconds = hardwareState.durationSeconds;
+    hasConfirmedState = true;
+    _hardwareStateController.add(hardwareState);
+
+    if (isInitialState && hardwareState.isRunning) {
+      intensity = hardwareState.intensity;
+      durationSeconds = hardwareState.durationSeconds == 0
+          ? defaultDurationSeconds
+          : hardwareState.durationSeconds.clamp(1, maxDurationSeconds).toInt();
     }
+    _notify();
   }
 
   Future<void> _handleUnexpectedDisconnection() async {
-    await _cancelPendingIntensityWrites();
+    await _waitForControlWrite();
     await _cancelDeviceSubscriptions(keepConnectionSubscription: true);
-    intensity = 0;
-    hasIntensity = false;
+    confirmedIntensity = 0;
+    confirmedDurationSeconds = 0;
+    hasConfirmedState = false;
     _setStatus(
       Esp32BleStatus.disconnected,
       message:
@@ -538,12 +589,8 @@ class Esp32BleController extends ChangeNotifier {
     _scanResultsSubscription = null;
   }
 
-  Future<void> _cancelPendingIntensityWrites() async {
-    _writeDebounce?.cancel();
-    _writeDebounce = null;
-    _pendingIntensity = null;
-    _isAdjustingIntensity = false;
-    final activeWrite = _writeLoopCompleter?.future;
+  Future<void> _waitForControlWrite() async {
+    final activeWrite = _controlWriteCompleter?.future;
     if (activeWrite != null) await activeWrite;
   }
 

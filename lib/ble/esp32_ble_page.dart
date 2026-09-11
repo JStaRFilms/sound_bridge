@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import 'esp32_ble_controller.dart';
 
 class Esp32BlePage extends StatefulWidget {
-  const Esp32BlePage({super.key});
+  const Esp32BlePage({this.controller, super.key});
+
+  final Esp32BleController? controller;
 
   @override
   State<Esp32BlePage> createState() => _Esp32BlePageState();
@@ -13,18 +15,22 @@ class Esp32BlePage extends StatefulWidget {
 
 class _Esp32BlePageState extends State<Esp32BlePage> {
   late final Esp32BleController _controller;
+  late final bool _ownsController;
 
   @override
   void initState() {
     super.initState();
-    _controller = Esp32BleController();
-    unawaited(_controller.initialize());
+    _ownsController = widget.controller == null;
+    _controller = widget.controller ?? Esp32BleController();
+    if (_ownsController) unawaited(_controller.initialize());
   }
 
   @override
   void dispose() {
-    unawaited(_controller.close());
-    _controller.dispose();
+    if (_ownsController) {
+      unawaited(_controller.close());
+      _controller.dispose();
+    }
     super.dispose();
   }
 
@@ -186,14 +192,18 @@ class _IntensityCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final enabled = controller.canAdjustIntensity;
-    final stateColor = controller.hasIntensity
-        ? const Color(0xFF2563EB)
-        : const Color(0xFF94A3B8);
-    final percentage = controller.hasIntensity
-        ? '${controller.intensityPercentage}%'
-        : '—';
-    final rawValue = controller.hasIntensity ? '${controller.intensity}' : '—';
+    final enabled = controller.canControlHardware;
+    final stateColor = controller.isHardwareRunning
+        ? const Color(0xFF15803D)
+        : const Color(0xFF64748B);
+    final stateLabel = controller.hasConfirmedState
+        ? controller.isHardwareRunning
+              ? 'RUNNING'
+              : 'STOPPED'
+        : 'UNKNOWN';
+    final confirmedValues = controller.hasConfirmedState
+        ? 'Confirmed: ${controller.confirmedIntensity} / 255 • ${controller.confirmedDurationSeconds}s'
+        : 'Waiting for ESP32 state…';
 
     return Card(
       elevation: 0,
@@ -207,84 +217,125 @@ class _IntensityCard extends StatelessWidget {
         child: Column(
           children: [
             Text(
-              'PWM INTENSITY',
+              'HARDWARE STATE',
               style: Theme.of(context).textTheme.labelLarge,
             ),
             const SizedBox(height: 14),
-            Container(
-              width: 104,
-              height: 104,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: stateColor.withValues(alpha: 0.1),
-                border: Border.all(
-                  color: stateColor.withValues(alpha: 0.35),
-                  width: 2,
-                ),
-              ),
-              child: Text(
-                percentage,
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  color: stateColor,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
             Text(
-              'Raw value: $rawValue / ${Esp32BleController.maxIntensity}',
-              textAlign: TextAlign.center,
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+              stateLabel,
+              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                color: stateColor,
+                fontWeight: FontWeight.w800,
+              ),
             ),
-            Slider(
+            Text(
+              confirmedValues,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 22),
+            _LabeledSlider(
+              label: 'Intensity',
+              valueLabel:
+                  '${controller.intensity} / 255 • ${controller.intensityPercentage}%',
+              value: controller.intensity.toDouble(),
               min: 0,
               max: Esp32BleController.maxIntensity.toDouble(),
               divisions: Esp32BleController.maxIntensity,
-              value: controller.intensity.toDouble(),
-              label: '${controller.intensity}',
-              onChangeStart: enabled
-                  ? (_) => controller.beginIntensityAdjustment()
-                  : null,
               onChanged: enabled
                   ? (value) => controller.updateIntensity(value.round())
                   : null,
-              onChangeEnd: enabled
-                  ? (value) =>
-                        controller.finishIntensityAdjustment(value.round())
+            ),
+            const SizedBox(height: 12),
+            _LabeledSlider(
+              label: 'Duration',
+              valueLabel: '${controller.durationSeconds}s',
+              value: controller.durationSeconds.toDouble(),
+              min: 1,
+              max: Esp32BleController.maxDurationSeconds.toDouble(),
+              divisions: Esp32BleController.maxDurationSeconds - 1,
+              onChanged: enabled
+                  ? (value) => controller.updateDuration(value.round())
                   : null,
             ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text('0'),
-                  if (controller.commandInProgress)
-                    Text(
-                      'Sending…',
-                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                        color: const Color(0xFF2563EB),
-                      ),
-                    )
-                  else
-                    Text(
-                      controller.isConnected
-                          ? 'Synced from ESP32 notifications'
-                          : 'Connect to adjust',
-                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                        color: const Color(0xFF64748B),
-                      ),
-                    ),
-                  const Text('255'),
-                ],
-              ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: enabled ? controller.startOutput : null,
+                    icon: controller.commandInProgress
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.play_arrow_rounded),
+                    label: const Text('Start'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: enabled ? controller.stopOutput : null,
+                    icon: const Icon(Icons.stop_rounded),
+                    label: const Text('Stop'),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _LabeledSlider extends StatelessWidget {
+  const _LabeledSlider({
+    required this.label,
+    required this.valueLabel,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.divisions,
+    required this.onChanged,
+  });
+
+  final String label;
+  final String valueLabel;
+  final double value;
+  final double min;
+  final double max;
+  final int divisions;
+  final ValueChanged<double>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: Theme.of(
+                  context,
+                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+              ),
+            ),
+            Text(valueLabel),
+          ],
+        ),
+        Slider(
+          min: min,
+          max: max,
+          divisions: divisions,
+          value: value,
+          label: valueLabel,
+          onChanged: onChanged,
+        ),
+      ],
     );
   }
 }
