@@ -14,6 +14,8 @@ import 'ble/esp32_ble_controller.dart';
 import 'ble/esp32_ble_page.dart';
 import 'ble/server_response_ble_event_handler.dart';
 import 'vibration_service.dart';
+import 'event_alert_settings.dart';
+import 'event_alerts_page.dart';
 
 const _uploadEndpoint = String.fromEnvironment(
   'AUDIO_UPLOAD_ENDPOINT',
@@ -22,8 +24,11 @@ const _uploadEndpoint = String.fromEnvironment(
 const _legacyUploadEndpoint = 'https://example.com/audio';
 const _legacyNameMentionPath = '/v1/audio/name-mention';
 const _analyzePath = '/v1/audio/analyze';
+const _classifierWakePath = '/v1/audio/classifier/wake';
 const _uploadEndpointKey = 'upload_endpoint';
 const _targetNameKey = 'target_name';
+
+typedef WakeClassifierRequest = Future<http.Response> Function(Uri uri);
 
 class SettingsValues {
   const SettingsValues({required this.endpoint, required this.targetName});
@@ -37,7 +42,9 @@ void main() {
 }
 
 class SoundBridgeApp extends StatelessWidget {
-  const SoundBridgeApp({super.key});
+  const SoundBridgeApp({super.key, this.wakeClassifierRequest});
+
+  final WakeClassifierRequest? wakeClassifierRequest;
 
   @override
   Widget build(BuildContext context) {
@@ -53,7 +60,7 @@ class SoundBridgeApp extends StatelessWidget {
           displayColor: const Color(0xFF0F172A),
         ),
       ),
-      home: const DashboardPage(),
+      home: DashboardPage(wakeClassifierRequest: wakeClassifierRequest),
     );
   }
 }
@@ -61,10 +68,15 @@ class SoundBridgeApp extends StatelessWidget {
 enum DashboardStatus { idle, recording, ready, uploading, success, error }
 
 class DashboardPage extends StatefulWidget {
-  const DashboardPage({super.key, this.initialRecordingPath});
+  const DashboardPage({
+    super.key,
+    this.initialRecordingPath,
+    this.wakeClassifierRequest,
+  });
 
   /// Used by widget tests to simulate a completed recording.
   final String? initialRecordingPath;
+  final WakeClassifierRequest? wakeClassifierRequest;
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
@@ -187,6 +199,7 @@ class _DashboardPageState extends State<DashboardPage> {
     super.initState();
     _bleResponseEventHandler = ServerResponseBleEventHandler(
       output: _bleController,
+      loadSettings: EventAlertSettings.load,
     );
     final initialRecordingPath = widget.initialRecordingPath;
     if (initialRecordingPath != null) {
@@ -343,9 +356,11 @@ class _DashboardPageState extends State<DashboardPage> {
           _status = DashboardStatus.success;
           _message = _formatUploadSuccess(responseBody);
         });
-        unawaited(
-          _bleResponseEventHandler.handleSuccessfulResponse(responseBody),
-        );
+        if (_bleController.isConnected) {
+          unawaited(
+            _bleResponseEventHandler.handleSuccessfulResponse(responseBody),
+          );
+        }
       } else {
         _showSendAudioError(
           _formatUploadFailure(response.statusCode, responseBody),
@@ -421,6 +436,8 @@ class _DashboardPageState extends State<DashboardPage> {
           initialEndpoint: _uploadEndpointUrl,
           initialTargetName: _targetName,
           bleController: _bleController,
+          alertHandler: _bleResponseEventHandler,
+          wakeClassifierRequest: widget.wakeClassifierRequest,
         );
       },
     );
@@ -721,12 +738,16 @@ class SettingsSheet extends StatefulWidget {
     required this.initialEndpoint,
     required this.initialTargetName,
     required this.bleController,
+    required this.alertHandler,
+    this.wakeClassifierRequest,
     super.key,
   });
 
   final String initialEndpoint;
   final String initialTargetName;
   final Esp32BleController bleController;
+  final ServerResponseBleEventHandler alertHandler;
+  final WakeClassifierRequest? wakeClassifierRequest;
 
   @override
   State<SettingsSheet> createState() => _SettingsSheetState();
@@ -735,6 +756,9 @@ class SettingsSheet extends StatefulWidget {
 class _SettingsSheetState extends State<SettingsSheet> {
   late final TextEditingController _endpointController;
   late final TextEditingController _targetNameController;
+  bool _isWakingClassifier = false;
+  String? _classifierWakeMessage;
+  bool _classifierWakeSucceeded = false;
 
   @override
   void initState() {
@@ -759,6 +783,61 @@ class _SettingsSheetState extends State<SettingsSheet> {
         targetName: _targetNameController.text,
       ),
     );
+  }
+
+  Uri? _classifierWakeUri() {
+    final endpoint = Uri.tryParse(_endpointController.text.trim());
+    if (endpoint == null ||
+        !endpoint.hasAuthority ||
+        (endpoint.scheme != 'http' && endpoint.scheme != 'https')) {
+      return null;
+    }
+
+    return endpoint.replace(path: _classifierWakePath, query: '', fragment: '');
+  }
+
+  Future<void> _wakeClassifier() async {
+    if (_isWakingClassifier) return;
+
+    final wakeUri = _classifierWakeUri();
+    if (wakeUri == null) {
+      setState(() {
+        _classifierWakeSucceeded = false;
+        _classifierWakeMessage = 'Enter a valid API endpoint first.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isWakingClassifier = true;
+      _classifierWakeMessage = null;
+    });
+
+    try {
+      final response =
+          await (widget.wakeClassifierRequest?.call(wakeUri) ??
+                  http.post(wakeUri))
+              .timeout(const Duration(seconds: 130));
+      if (!mounted) return;
+
+      final succeeded = response.statusCode >= 200 && response.statusCode < 300;
+      setState(() {
+        _classifierWakeSucceeded = succeeded;
+        _classifierWakeMessage = succeeded
+            ? 'Classification service is awake.'
+            : 'Could not wake the classification service (${response.statusCode}).';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _classifierWakeSucceeded = false;
+        _classifierWakeMessage = 'Could not reach the classification service.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _isWakingClassifier = false);
+      }
+    }
   }
 
   @override
@@ -820,7 +899,56 @@ class _SettingsSheetState extends State<SettingsSheet> {
                 onSubmitted: (_) => _save(),
               ),
               const SizedBox(height: 16),
+              OutlinedButton.icon(
+                key: const Key('wakeClassifierButton'),
+                onPressed: _isWakingClassifier ? null : _wakeClassifier,
+                icon: _isWakingClassifier
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.power_settings_new_rounded),
+                label: Text(
+                  _isWakingClassifier
+                      ? 'Waking classification service...'
+                      : 'Wake classification service',
+                ),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+              if (_classifierWakeMessage != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  _classifierWakeMessage!,
+                  key: const Key('classifierWakeMessage'),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: _classifierWakeSucceeded
+                        ? const Color(0xFF15803D)
+                        : const Color(0xFFB91C1C),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 16),
               BleSettingsCard(controller: widget.bleController),
+              ListTile(
+                leading: const Icon(Icons.notifications_active_outlined),
+                title: const Text('Event alerts'),
+                subtitle: const Text('Intensity, duration and repetitions'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => EventAlertsPage(
+                      controller: widget.bleController,
+                      handler: widget.alertHandler,
+                    ),
+                  ),
+                ),
+              ),
               const SizedBox(height: 16),
               FilledButton.icon(
                 onPressed: _save,

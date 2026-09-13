@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:sound_bridge/main.dart';
@@ -53,7 +54,7 @@ void main() {
     expect(intensitySlider.divisions, 255);
     expect(intensitySlider.onChanged, isNull);
     expect(durationSlider.value, 5);
-    expect(durationSlider.max, 30);
+    expect(durationSlider.max, 5);
     expect(durationSlider.onChanged, isNull);
     expect(
       find.text('Connect the ESP32 from Settings to enable these controls.'),
@@ -135,5 +136,33 @@ void main() {
       findsOneWidget,
     );
     expect(find.text('Target: not set'), findsOneWidget);
+  });
+
+  testWidgets('Settings can wake the classification service', (
+    WidgetTester tester,
+  ) async {
+    Uri? requestedUri;
+    await tester.pumpWidget(
+      SoundBridgeApp(
+        wakeClassifierRequest: (uri) async {
+          requestedUri = uri;
+          return http.Response('{"status":"awake"}', 200);
+        },
+      ),
+    );
+
+    await tester.tap(find.byTooltip('Settings'));
+    await tester.pumpAndSettle();
+
+    final wakeButton = find.byKey(const Key('wakeClassifierButton'));
+    await tester.ensureVisible(wakeButton);
+    await tester.tap(wakeButton);
+    await tester.pumpAndSettle();
+
+    expect(
+      requestedUri,
+      Uri.parse('http://127.0.0.1:8000/v1/audio/classifier/wake'),
+    );
+    expect(find.text('Classification service is awake.'), findsOneWidget);
   });
 }
