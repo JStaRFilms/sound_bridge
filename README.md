@@ -2,6 +2,58 @@
 
 Sound Bridge is a Flutter app for recording short voice input from the device microphone and sending the captured audio to a backend endpoint.
 
+## For Testers (APK + Backend Quickstart)
+
+### 1. Install the test build
+
+1. Open the fork's Actions page: `https://github.com/JStaRFilms/sound_bridge/actions` (GitHub login required).
+2. Click the latest successful **Build debug APK** run.
+3. Download the **sound-bridge-debug-apk** artifact and unzip it to get `app-debug.apk`.
+4. On the Android phone, allow **Install unknown apps** for your browser/files app, then install the APK.
+
+### 2. Start the backend (required)
+
+The app does no analysis on-device. You must run the `audio-event-api` backend:
+
+1. On a computer, open the `audio-event-api` project and follow its README (install deps, set its API keys).
+2. Start it bound to the network (not localhost only), e.g.:
+   ```text
+   uvicorn <module>:app --host 0.0.0.0 --port 8000
+   ```
+   (Confirm the exact module path in that repo's README.)
+3. Sanity-check from that computer:
+   ```text
+   curl http://<PC-LAN-IP>:8000/v1/audio/classifier/wake
+   ```
+   It should respond instead of refusing the connection.
+
+### 3. Connect the app to the backend
+
+1. Put the phone on the **same Wi-Fi** as the backend computer.
+2. Open Sound Bridge → gear icon (Settings).
+3. Set **API endpoint** to your computer's LAN address, e.g.:
+   ```text
+   http://192.168.1.108:8000/v1/audio/analyze
+   ```
+4. Set **Target name** (e.g. `Peter`) and tap **Save Settings**.
+
+> Do NOT use `127.0.0.1` on a physical phone — on the phone that address is the phone itself, so uploads always fail with "Connection refused". The app now warns you when the endpoint is a loopback address.
+
+### 4. Test flow
+
+1. Tap **Listen**, speak, tap again to stop.
+2. Optional: **Play Recording** to check the clip.
+3. Tap **Send Audio** and read the result on screen.
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `Could not reach ...` / connection refused | Same Wi-Fi? Backend running with `--host 0.0.0.0`? Endpoint uses the PC's LAN IP, not `127.0.0.1`? |
+| `Set a target name in Settings` | Target name is empty — fill it in Settings. |
+| `Upload timed out` | Backend overloaded or unreachable — check the server logs. |
+| Non-2xx status message | Server got the file but rejected it — the message body shown is from the server. |
+
 ## Product Goal
 
 The app should provide a simple dashboard with two primary actions:
