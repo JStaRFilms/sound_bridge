@@ -134,6 +134,58 @@ class _DashboardPageState extends State<DashboardPage> {
     return 'Upload failed with status $statusCode: $trimmedBody';
   }
 
+  bool _isLoopbackEndpoint(Uri? uri) {
+    if (uri == null) return false;
+    final host = uri.host.toLowerCase();
+    return host == '127.0.0.1' || host == 'localhost' || host == '::1';
+  }
+
+  String _friendlyUploadError(Object error, String endpointUrl) {
+    final raw = error.toString();
+    final lower = raw.toLowerCase();
+    final endpoint = Uri.tryParse(endpointUrl);
+    final isLoopback = _isLoopbackEndpoint(endpoint);
+    final isTimeout =
+        error is TimeoutException ||
+        lower.contains('timeoutexception') ||
+        lower.contains('timed out');
+    final isConnection =
+        error is SocketException ||
+        error is http.ClientException ||
+        lower.contains('socketexception') ||
+        lower.contains('clientexception') ||
+        lower.contains('connection refused') ||
+        lower.contains('failed host lookup') ||
+        lower.contains('network is unreachable') ||
+        lower.contains('connection timed out') ||
+        lower.contains('errno = 111');
+
+    if (isTimeout) {
+      return 'Upload timed out reaching $endpointUrl. '
+          'Check the endpoint and that the backend is running, then try again.';
+    }
+
+    if (isConnection) {
+      if (isLoopback) {
+        return 'Could not reach $endpointUrl. '
+            '127.0.0.1 on a physical phone is the phone itself, not your computer. '
+            'Use your computer\'s Wi-Fi IP in Settings '
+            '(e.g. http://192.168.1.108:8000/v1/audio/analyze), '
+            'keep both devices on the same Wi-Fi, and start the backend with --host 0.0.0.0 --port 8000.';
+      }
+      return 'Could not reach $endpointUrl. '
+          'Check the endpoint, Wi-Fi connection, and that the backend is running, then try again.';
+    }
+
+    final detail = raw.trim();
+    if (detail.isEmpty) {
+      return 'Upload failed. Please try again.';
+    }
+    // Keep unknown errors short in the UI; full detail stays in debugPrint.
+    final short = detail.length > 220 ? '${detail.substring(0, 220)}…' : detail;
+    return 'Upload failed. $short';
+  }
+
   String _normalizeUploadEndpoint(String endpoint) {
     final uri = Uri.tryParse(endpoint);
     if (uri == null || uri.path != _legacyNameMentionPath) {
@@ -344,7 +396,9 @@ class _DashboardPageState extends State<DashboardPage> {
 
       debugPrint('Send Audio Filename: $filename');
 
-      final response = await request.send();
+      final response = await request
+          .send()
+          .timeout(const Duration(seconds: 30));
       final responseBody = await response.stream.bytesToString();
       debugPrint(
         'Analyze Response (${response.statusCode}): $responseBody',
@@ -367,9 +421,8 @@ class _DashboardPageState extends State<DashboardPage> {
         );
       }
     } catch (error) {
-      final errorText = error.toString().trim();
-      final detail = errorText.isEmpty ? '' : ' - $errorText';
-      _showSendAudioError('Upload failed: ${error.runtimeType}$detail');
+      debugPrint('Send Audio Error (raw): $error');
+      _showSendAudioError(_friendlyUploadError(error, _uploadEndpointUrl));
     }
   }
 
@@ -664,6 +717,21 @@ class _DashboardPageState extends State<DashboardPage> {
                             style: Theme.of(context).textTheme.labelSmall
                                 ?.copyWith(color: const Color(0xFF94A3B8)),
                           ),
+                          if (_isLoopbackEndpoint(
+                            Uri.tryParse(_uploadEndpointUrl),
+                          )) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              'On a physical phone, 127.0.0.1 is the phone itself. '
+                              'Set your computer\'s Wi-Fi IP in Settings.',
+                              textAlign: TextAlign.center,
+                              style: Theme.of(context).textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: const Color(0xFFB45309),
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -767,10 +835,23 @@ class _SettingsSheetState extends State<SettingsSheet> {
     _targetNameController = TextEditingController(
       text: widget.initialTargetName,
     );
+    _endpointController.addListener(_onEndpointChanged);
+  }
+
+  void _onEndpointChanged() {
+    if (mounted) setState(() {});
+  }
+
+  bool get _endpointIsLoopback {
+    final uri = Uri.tryParse(_endpointController.text.trim());
+    if (uri == null) return false;
+    final host = uri.host.toLowerCase();
+    return host == '127.0.0.1' || host == 'localhost' || host == '::1';
   }
 
   @override
   void dispose() {
+    _endpointController.removeListener(_onEndpointChanged);
     _endpointController.dispose();
     _targetNameController.dispose();
     super.dispose();
@@ -879,11 +960,24 @@ class _SettingsSheetState extends State<SettingsSheet> {
                 decoration: InputDecoration(
                   labelText: 'API endpoint',
                   hintText: 'http://127.0.0.1:8000/v1/audio/analyze',
+                  helperText:
+                      'Physical phone? Use your PC\'s Wi-Fi IP, e.g. http://192.168.1.108:8000/v1/audio/analyze',
+                  helperMaxLines: 2,
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(8),
                   ),
                 ),
               ),
+              if (_endpointIsLoopback) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '127.0.0.1 points to the phone itself. On a real device this always fails — switch to your computer\'s LAN IP.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFFB45309),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
               const SizedBox(height: 16),
               TextField(
                 controller: _targetNameController,
